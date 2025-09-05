@@ -25,6 +25,8 @@ import carla
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Pose
 from geometry_msgs.msg import PoseWithCovarianceStamped
+from geometry_msgs.msg import AccelWithCovarianceStamped
+from nav_msgs.msg import Odometry
 import numpy
 import rclpy
 from rosgraph_msgs.msg import Clock
@@ -61,19 +63,31 @@ class carla_ros2_interface(object):
         self.id_to_camera_info_map = {}
         self.cv_bridge = CvBridge()
         self.first_ = True
+        self.pub_camera = {}  # Multiple camera publishers
+        self.pub_camera_info = {}  # Multiple camera info publishers  
+        self.camera_info_cache = {}  # Cache for each camera's info
         self.pub_lidar = {}
         self.sensor_frequencies = {
             "top": 11,
             "left": 11,
             "right": 11,
-            "camera": 11,
+            "CAM_FRONT": 11,
+            "CAM_FRONT_LEFT": 11,
+            "CAM_FRONT_RIGHT": 11,
+            "CAM_BACK": 11,
+            "CAM_BACK_LEFT": 11,
+            "CAM_BACK_RIGHT": 11,
             "imu": 50,
             "status": 50,
             "pose": 2,
         }
+        # Use simulation timestamps instead of wall clock time
         self.publish_prev_times = {
-            sensor: datetime.datetime.now() for sensor in self.sensor_frequencies
+            sensor: 0.0 for sensor in self.sensor_frequencies
         }
+        
+        # Thread synchronization lock for shared data
+        self.lock = threading.Lock()
 
         # initialize ros2 node
         rclpy.init(args=None)
@@ -136,16 +150,25 @@ class carla_ros2_interface(object):
         self.pub_actuation_status = self.ros2_node.create_publisher(
             ActuationStatusStamped, "/vehicle/status/actuation_status", 1
         )
+        # VAD input publishers
+        self.pub_kinematic_state = self.ros2_node.create_publisher(
+            Odometry, "/localization/kinematic_state", 1
+        )
+        self.pub_acceleration = self.ros2_node.create_publisher(
+            AccelWithCovarianceStamped, "/localization/acceleration", 1
+        )
 
         # Create Publisher for each Physical Sensors
         for sensor in self.sensors["sensors"]:
             self.id_to_sensor_type_map[sensor["id"]] = sensor["type"]
             if sensor["type"] == "sensor.camera.rgb":
-                self.pub_camera = self.ros2_node.create_publisher(
-                    Image, "/sensing/camera/traffic_light/image_raw", 1
+                cam_id = sensor["id"]
+                # Create publishers for each camera with unique topics
+                self.pub_camera[cam_id] = self.ros2_node.create_publisher(
+                    Image, f"/sensing/camera/{cam_id}/image_raw", 1
                 )
-                self.pub_camera_info = self.ros2_node.create_publisher(
-                    CameraInfo, "/sensing/camera/traffic_light/camera_info", 1
+                self.pub_camera_info[cam_id] = self.ros2_node.create_publisher(
+                    CameraInfo, f"/sensing/camera/{cam_id}/camera_info", 1
                 )
             elif sensor["type"] == "sensor.lidar.ray_cast":
                 if sensor["id"] in self.sensor_frequencies:
@@ -177,12 +200,17 @@ class carla_ros2_interface(object):
         return self.param_values
 
     def checkFrequency(self, sensor):
-        time_delta = (
-            datetime.datetime.now() - self.publish_prev_times[sensor]
-        ).microseconds / 1000000.0
-        if 1.0 / time_delta >= self.sensor_frequencies[sensor]:
-            return True
-        return False
+        """Check if enough simulation time has passed to publish sensor data."""
+        last_pub_time = self.publish_prev_times.get(sensor, 0.0)
+        if last_pub_time == 0.0:  # First time publishing
+            return False  # False means can publish
+        
+        time_delta = self.timestamp - last_pub_time
+        # Check if time interval is large enough
+        if time_delta >= (1.0 / self.sensor_frequencies[sensor]):
+            return False  # False means can publish
+        else:
+            return True   # True means frequency too high, skip publishing
 
     def get_msg_header(self, frame_id):
         """Obtain and modify ROS message header."""
@@ -197,7 +225,7 @@ class carla_ros2_interface(object):
         """Transform the received lidar measurement into a ROS point cloud message."""
         if self.checkFrequency(id_):
             return
-        self.publish_prev_times[id_] = datetime.datetime.now()
+        self.publish_prev_times[id_] = self.timestamp
 
         header = self.get_msg_header(frame_id="velodyne_top_changed")
         fields = [
@@ -222,11 +250,19 @@ class carla_ros2_interface(object):
         channel = numpy.empty((0, 1), dtype=numpy.uint16)
         self.channels = self.sensors["sensors"]
 
-        for i in range(self.channels[1]["channels"]):
-            current_ring_points_count = carla_lidar_measurement.get_point_count(i)
-            channel = numpy.vstack(
-                (channel, numpy.full((current_ring_points_count, 1), i, dtype=numpy.uint16))
-            )
+        # Find LiDAR sensor dynamically (not hardcoded index 1)
+        lidar_sensor = None
+        for sensor in self.channels:
+            if sensor["type"] == "sensor.lidar.ray_cast":
+                lidar_sensor = sensor
+                break
+        
+        if lidar_sensor:
+            for i in range(lidar_sensor["channels"]):
+                current_ring_points_count = carla_lidar_measurement.get_point_count(i)
+                channel = numpy.vstack(
+                    (channel, numpy.full((current_ring_points_count, 1), i, dtype=numpy.uint16))
+                )
 
         lidar_data = numpy.hstack((lidar_data[:, :3], intensity, return_type, channel))
         lidar_data[:, 1] *= -1
@@ -256,16 +292,17 @@ class carla_ros2_interface(object):
         pose = data.pose.pose
         pose.position.z += 2.0
         carla_pose_transform = ros_pose_to_carla_transform(pose)
-        if self.ego_actor is not None:
-            self.ego_actor.set_transform(carla_pose_transform)
-        else:
-            print("Can't find Ego Vehicle")
+        with self.lock:
+            if self.ego_actor is not None:
+                self.ego_actor.set_transform(carla_pose_transform)
+            else:
+                print("Can't find Ego Vehicle")
 
     def pose(self):
         """Transform odometry data to Pose and publish Pose with Covariance message."""
         if self.checkFrequency("pose"):
             return
-        self.publish_prev_times["pose"] = datetime.datetime.now()
+        self.publish_prev_times["pose"] = self.timestamp
 
         header = self.get_msg_header(frame_id="map")
         out_pose_with_cov = PoseWithCovarianceStamped()
@@ -316,58 +353,72 @@ class carla_ros2_interface(object):
         ]
         self.pub_pose_with_cov.publish(out_pose_with_cov)
 
-    def _build_camera_info(self, camera_actor):
-        """Build camera info."""
+    def _build_camera_info(self, camera_actor, cam_id):
+        """Build camera info calculated from camera actor properties."""
         camera_info = CameraInfo()
         camera_info.width = camera_actor.width
         camera_info.height = camera_actor.height
         camera_info.distortion_model = "plumb_bob"
+        
+        # Calculate focal length from camera FOV and image dimensions
         cx = camera_info.width / 2.0
         cy = camera_info.height / 2.0
         fx = camera_info.width / (2.0 * math.tan(camera_actor.fov * math.pi / 360.0))
-        fy = fx
+        fy = fx  # Assume square pixels
+        
         camera_info.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
         camera_info.d = [0.0, 0.0, 0.0, 0.0, 0.0]
         camera_info.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
         camera_info.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
-        self._camera_info = camera_info
+        
+        return camera_info
 
-    def camera(self, carla_camera_data):
-        """Transform the received carla camera data into a ROS image and info message and publish."""
-        while self.first_:
-            self._camera_info_ = self._build_camera_info(carla_camera_data)
-            self.first_ = False
+    def camera(self, carla_camera_data, cam_id):
+        """Handle multiple cameras with dynamic routing by sensor ID."""
+        # Build camera info if not cached  
+        if cam_id not in self.camera_info_cache:
+            self.camera_info_cache[cam_id] = self._build_camera_info(carla_camera_data, cam_id)
 
-        if self.checkFrequency("camera"):
+        # Initialize timing for this camera if not present
+        if cam_id not in self.publish_prev_times:
+            self.publish_prev_times[cam_id] = 0.0
+
+        # Each camera uses its own frequency timer
+        if self.checkFrequency(cam_id):
             return
-        self.publish_prev_times["camera"] = datetime.datetime.now()
+        self.publish_prev_times[cam_id] = self.timestamp
 
+        # Get native Carla image
         image_data_array = numpy.ndarray(
             shape=(carla_camera_data.height, carla_camera_data.width, 4),
             dtype=numpy.uint8,
             buffer=carla_camera_data.raw_data,
         )
+        
         # cspell:ignore interp bgra
         img_msg = self.cv_bridge.cv2_to_imgmsg(image_data_array, encoding="bgra8")
         img_msg.header = self.get_msg_header(
-            frame_id="traffic_light_left_camera/camera_optical_link"
+            frame_id=f"{cam_id.lower()}/camera_optical_link"
         )
-        cam_info = self._camera_info
+        
+        # Publish to appropriate topics for this camera
+        cam_info = self.camera_info_cache[cam_id]
         cam_info.header = img_msg.header
-        self.pub_camera_info.publish(cam_info)
-        self.pub_camera.publish(img_msg)
+        self.pub_camera_info[cam_id].publish(cam_info)
+        self.pub_camera[cam_id].publish(img_msg)
 
     def imu(self, carla_imu_measurement):
         """Transform a received imu measurement into a ROS Imu message and publish Imu message."""
         if self.checkFrequency("imu"):
             return
-        self.publish_prev_times["imu"] = datetime.datetime.now()
+        self.publish_prev_times["imu"] = self.timestamp
 
         imu_msg = Imu()
         imu_msg.header = self.get_msg_header(frame_id="tamagawa/imu_link_changed")
-        imu_msg.angular_velocity.x = -carla_imu_measurement.gyroscope.x
-        imu_msg.angular_velocity.y = carla_imu_measurement.gyroscope.y
-        imu_msg.angular_velocity.z = -carla_imu_measurement.gyroscope.z
+        # Consistent coordinate transformation from CARLA IMU (X-front, Y-right, Z-up) to ROS base_link (X-front, Y-left, Z-up)
+        imu_msg.angular_velocity.x = carla_imu_measurement.gyroscope.x
+        imu_msg.angular_velocity.y = -carla_imu_measurement.gyroscope.y
+        imu_msg.angular_velocity.z = carla_imu_measurement.gyroscope.z
 
         imu_msg.linear_acceleration.x = carla_imu_measurement.accelerometer.x
         imu_msg.linear_acceleration.y = -carla_imu_measurement.accelerometer.y
@@ -412,14 +463,15 @@ class carla_ros2_interface(object):
         )
         out_cmd.steer = self.first_order_steering(-in_cmd.actuation.steer_cmd) * max_steer_ratio
         out_cmd.brake = in_cmd.actuation.brake_cmd
-        self.current_control = out_cmd
+        with self.lock:
+            self.current_control = out_cmd
 
     def ego_status(self):
         """Publish ego vehicle status."""
         if self.checkFrequency("status"):
             return
 
-        self.publish_prev_times["status"] = datetime.datetime.now()
+        self.publish_prev_times["status"] = self.timestamp
 
         # convert velocity from cartesian to ego frame
         trans_mat = numpy.array(self.ego_actor.get_transform().get_matrix()).reshape(4, 4)
@@ -469,6 +521,94 @@ class carla_ros2_interface(object):
         self.pub_steering_state.publish(out_steering_state)
         self.pub_ctrl_mode.publish(out_ctrl_mode)
         self.pub_gear_state.publish(out_gear_state)
+        
+        # VAD input messages
+        self.publish_vad_inputs(out_vel_state.header)
+
+    def publish_vad_inputs(self, header):
+        """Publish VAD required inputs: kinematic_state and acceleration."""
+        # Get current transform, velocity and acceleration from CARLA
+        transform = self.ego_actor.get_transform()
+        velocity = self.ego_actor.get_velocity()
+        angular_velocity = self.ego_actor.get_angular_velocity()
+        acceleration = self.ego_actor.get_acceleration()
+        
+        # Create Odometry message for kinematic_state
+        odom_msg = Odometry()
+        odom_msg.header = Header()
+        odom_msg.header.stamp = header.stamp
+        odom_msg.header.frame_id = "map"
+        odom_msg.child_frame_id = "base_link"
+        
+        # Set pose (position and orientation)
+        odom_msg.pose.pose.position.x = transform.location.x
+        odom_msg.pose.pose.position.y = -transform.location.y  # CARLA to ROS coordinate conversion
+        odom_msg.pose.pose.position.z = transform.location.z
+        
+        # Convert CARLA rotation to ROS quaternion
+        quaternion = carla_rotation_to_ros_quaternion(transform.rotation)
+        odom_msg.pose.pose.orientation.x = quaternion.x
+        odom_msg.pose.pose.orientation.y = quaternion.y
+        odom_msg.pose.pose.orientation.z = quaternion.z
+        odom_msg.pose.pose.orientation.w = quaternion.w
+        
+        # Set velocity (linear and angular)
+        odom_msg.twist.twist.linear.x = velocity.x
+        odom_msg.twist.twist.linear.y = -velocity.y  # CARLA to ROS coordinate conversion
+        odom_msg.twist.twist.linear.z = velocity.z
+        odom_msg.twist.twist.angular.x = angular_velocity.x
+        odom_msg.twist.twist.angular.y = -angular_velocity.y  # CARLA to ROS coordinate conversion
+        odom_msg.twist.twist.angular.z = -angular_velocity.z  # CARLA to ROS coordinate conversion
+        
+        # Set covariance (can be tuned based on requirements)
+        pose_covariance = [0.0] * 36
+        twist_covariance = [0.0] * 36
+        # Set diagonal elements to small positive values (indicating low uncertainty)
+        for i in range(6):
+            pose_covariance[i * 7] = 0.1  # position and orientation uncertainty
+            twist_covariance[i * 7] = 0.1  # linear and angular velocity uncertainty
+        odom_msg.pose.covariance = pose_covariance
+        odom_msg.twist.covariance = twist_covariance
+        
+        # Create AccelWithCovarianceStamped message for acceleration
+        accel_msg = AccelWithCovarianceStamped()
+        accel_msg.header = Header()
+        accel_msg.header.stamp = header.stamp
+        accel_msg.header.frame_id = "base_link"
+        
+        # Transform acceleration from world frame to base_link frame
+        # Get rotation matrix from world to base_link (inverse of base_link to world)
+        trans_mat = numpy.array(transform.get_matrix()).reshape(4, 4)
+        rot_mat = trans_mat[0:3, 0:3]
+        inv_rot_mat = rot_mat.T  # Transpose = inverse for rotation matrix
+        
+        # Transform acceleration vector from world frame to vehicle frame
+        world_accel_vec = numpy.array([
+            acceleration.x,
+            -acceleration.y,  # CARLA to ROS coordinate conversion
+            acceleration.z
+        ]).reshape(3, 1)
+        base_link_accel = (inv_rot_mat @ world_accel_vec).T[0]
+        
+        # Set linear acceleration in base_link frame
+        accel_msg.accel.accel.linear.x = base_link_accel[0]
+        accel_msg.accel.accel.linear.y = base_link_accel[1]
+        accel_msg.accel.accel.linear.z = base_link_accel[2]
+        
+        # Set angular acceleration (CARLA doesn't provide this directly, set to zero)
+        accel_msg.accel.accel.angular.x = 0.0
+        accel_msg.accel.accel.angular.y = 0.0
+        accel_msg.accel.accel.angular.z = 0.0
+        
+        # Set covariance
+        accel_covariance = [0.0] * 36
+        for i in range(6):
+            accel_covariance[i * 7] = 0.1  # acceleration uncertainty
+        accel_msg.accel.covariance = accel_covariance
+        
+        # Publish the messages
+        self.pub_kinematic_state.publish(odom_msg)
+        self.pub_acceleration.publish(accel_msg)
 
     def run_step(self, input_data, timestamp):
         self.timestamp = timestamp
@@ -482,7 +622,7 @@ class carla_ros2_interface(object):
         for key, data in input_data.items():
             sensor_type = self.id_to_sensor_type_map[key]
             if sensor_type == "sensor.camera.rgb":
-                self.camera(data[1])
+                self.camera(data[1], key)  # Pass sensor ID (key) to camera function
             elif sensor_type == "sensor.other.gnss":
                 self.pose()
             elif sensor_type == "sensor.lidar.ray_cast":
@@ -494,7 +634,9 @@ class carla_ros2_interface(object):
 
         # Publish ego vehicle status
         self.ego_status()
-        return self.current_control
+        with self.lock:
+            control_to_return = self.current_control
+        return control_to_return
 
     def shutdown(self):
         self.ros2_node.destroy_node()
