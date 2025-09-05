@@ -39,6 +39,8 @@ from std_msgs.msg import Header
 from tier4_vehicle_msgs.msg import ActuationCommandStamped
 from tier4_vehicle_msgs.msg import ActuationStatusStamped
 from transforms3d.euler import euler2quat
+import tf2_ros
+from geometry_msgs.msg import TransformStamped
 
 from .modules.carla_data_provider import GameTime
 from .modules.carla_data_provider import datetime
@@ -150,13 +152,16 @@ class carla_ros2_interface(object):
         self.pub_actuation_status = self.ros2_node.create_publisher(
             ActuationStatusStamped, "/vehicle/status/actuation_status", 1
         )
-        # VAD input publishers
+        # Localization data publishers (for VAD and all Autoware modules)
         self.pub_kinematic_state = self.ros2_node.create_publisher(
             Odometry, "/localization/kinematic_state", 1
         )
         self.pub_acceleration = self.ros2_node.create_publisher(
             AccelWithCovarianceStamped, "/localization/acceleration", 1
         )
+        
+        # TF broadcaster for map->base_link transform
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self.ros2_node)
 
         # Create Publisher for each Physical Sensors
         for sensor in self.sensors["sensors"]:
@@ -522,11 +527,11 @@ class carla_ros2_interface(object):
         self.pub_ctrl_mode.publish(out_ctrl_mode)
         self.pub_gear_state.publish(out_gear_state)
         
-        # VAD input messages
-        self.publish_vad_inputs(out_vel_state.header)
+        # Localization data (used by VAD and other Autoware modules)
+        self.publish_localization_data(out_vel_state.header)
 
-    def publish_vad_inputs(self, header):
-        """Publish VAD required inputs: kinematic_state and acceleration."""
+    def publish_localization_data(self, header):
+        """Publish localization data: kinematic_state, acceleration, and TF transforms."""
         # Get current transform, velocity and acceleration from CARLA
         transform = self.ego_actor.get_transform()
         velocity = self.ego_actor.get_velocity()
@@ -609,6 +614,17 @@ class carla_ros2_interface(object):
         # Publish the messages
         self.pub_kinematic_state.publish(odom_msg)
         self.pub_acceleration.publish(accel_msg)
+        
+        # Publish TF transform from map to base_link
+        tf_msg = TransformStamped()
+        tf_msg.header = header
+        tf_msg.header.frame_id = "map"
+        tf_msg.child_frame_id = "base_link"
+        tf_msg.transform.translation.x = transform.location.x
+        tf_msg.transform.translation.y = -transform.location.y  # CARLA to ROS coordinate conversion
+        tf_msg.transform.translation.z = transform.location.z
+        tf_msg.transform.rotation = odom_msg.pose.pose.orientation  # Use same quaternion
+        self.tf_broadcaster.sendTransform(tf_msg)
 
     def run_step(self, input_data, timestamp):
         self.timestamp = timestamp
