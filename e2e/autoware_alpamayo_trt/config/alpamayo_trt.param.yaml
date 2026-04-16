@@ -1,0 +1,29 @@
+/**:
+  ros__parameters:
+    # Model
+    model_id: "nvidia/Alpamayo-R1-10B"
+    expert_onnx_path: ""  # Path to expert ONNX (auto-compiles TRT engine on first run)
+
+    # Inference settings
+    num_diffusion_steps: 10   # 10=best quality, 5=fast (~40ms faster, 1.3m trajectory diff)
+    use_greedy_decode: false   # true=deterministic+fast (~60ms faster, 2.6m trajectory diff)
+    top_p: 0.98                # Only used when use_greedy_decode=false
+    temperature: 0.6           # Only used when use_greedy_decode=false
+
+    # Topics (same as alpamayo_ros)
+    camera_topics:
+      - /sensing/camera/camera3/image_raw/compressed
+      - /sensing/camera/camera1/image_raw/compressed
+      - /sensing/camera/camera4/image_raw/compressed
+      - /sensing/camera/camera2/image_raw/compressed
+    odometry_topic: /localization/kinematic_state
+    trajectory_topic: /alpamayo/predicted_trajectory
+    cot_topic: /alpamayo/reasoning
+
+    # Frame and timing
+    frame_id: base_link
+    inference_period_sec: 1.0
+
+    # Data collection
+    num_frames: 4
+    num_history_steps: 16
