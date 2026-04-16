@@ -1,5 +1,5 @@
 <launch>
-  <arg name="alpamayo_trt_param_path" default="$(find-pkg-share autoware_alpamayo_trt)/config/alpamayo_trt.param.yaml"/>
+  <arg name="tensorrt_alpamayo_param_path" default="$(find-pkg-share autoware_tensorrt_alpamayo)/config/tensorrt_alpamayo.param.yaml"/>
 
   <arg name="vlm_engine_dir" default=""/>
   <arg name="multimodal_engine_dir" default=""/>
@@ -9,8 +9,8 @@
   <arg name="output/trajectory" default="/alpamayo/predicted_trajectory"/>
   <arg name="output/cot" default="/alpamayo/reasoning"/>
 
-  <node pkg="autoware_alpamayo_trt" exec="alpamayo_trt_node" name="alpamayo_trt_node" output="screen">
-    <param from="$(var alpamayo_trt_param_path)"/>
+  <node pkg="autoware_tensorrt_alpamayo" exec="tensorrt_alpamayo_node" name="tensorrt_alpamayo_node" output="screen">
+    <param from="$(var tensorrt_alpamayo_param_path)"/>
     <param name="vlm_engine_dir" value="$(var vlm_engine_dir)"/>
     <param name="multimodal_engine_dir" value="$(var multimodal_engine_dir)"/>
     <param name="expert_engine_path" value="$(var expert_engine_path)"/>

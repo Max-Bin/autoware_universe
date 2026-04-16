@@ -1,8 +1,8 @@
-# Autoware Alpamayo TRT
+# Autoware TensorRT Alpamayo
 
 ## Overview
 
-**Autoware Alpamayo TRT** is an end-to-end trajectory planner for autonomous vehicles based on [Alpamayo](https://github.com/NVlabs/alpamayo), NVIDIA's vision-language-action model for autonomous driving. It generates safe driving trajectories by combining:
+**Autoware TensorRT Alpamayo** is an end-to-end trajectory planner for autonomous vehicles based on [Alpamayo](https://github.com/NVlabs/alpamayo), NVIDIA's vision-language-action model for autonomous driving. It generates safe driving trajectories by combining:
 
 - **Vision-Language Model (VLM)**: Qwen3-VL-8B processes multi-camera images and produces chain-of-thought (CoT) driving reasoning
 - **Expert Diffusion Denoiser**: Flow matching with Euler integration generates trajectory waypoints conditioned on the VLM's understanding
@@ -30,7 +30,7 @@ Benchmarked on **NVIDIA RTX PRO 6000 Blackwell** (96 GB GDDR7, SM120) with 4 cam
 
 ### Enabling Speed Mode (~1.5 FPS)
 
-Set the following parameters in `alpamayo_trt.param.yaml`:
+Set the following parameters in `tensorrt_alpamayo.param.yaml`:
 
 ```yaml
 num_diffusion_steps: 5 # 5 instead of 10
@@ -48,7 +48,7 @@ Camera Topics (CompressedImage × 4)     Odometry Topic
         │                                      │
         ▼                                      ▼
 ┌─────────────────────────────────────────────────────┐
-│              Autoware Alpamayo TRT Node              │
+│           Autoware TensorRT Alpamayo Node            │
 │                                                     │
 │  Image Decode ──► Tokenizer ──► VLM (PyTorch BF16)  │
 │                                      │              │
@@ -92,13 +92,13 @@ huggingface-cli login
 ### Build
 
 ```bash
-colcon build --packages-select autoware_alpamayo_trt
+colcon build --packages-select autoware_tensorrt_alpamayo
 ```
 
 ### Launch
 
 ```bash
-ros2 launch autoware_alpamayo_trt alpamayo_trt.launch.xml
+ros2 launch autoware_tensorrt_alpamayo tensorrt_alpamayo.launch.xml
 ```
 
 ### Parameters

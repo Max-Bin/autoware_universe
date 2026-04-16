@@ -64,7 +64,7 @@ class AlpamayoTrtNode(Node):
     """Autoware ROS 2 node for Alpamayo E2E trajectory planning with TRT optimization."""
 
     def __init__(self) -> None:
-        super().__init__("alpamayo_trt_node")
+        super().__init__("tensorrt_alpamayo_node")
 
         # ── Parameters ──
         self.declare_parameter("model_id", "nvidia/Alpamayo-R1-10B")
@@ -83,8 +83,8 @@ class AlpamayoTrtNode(Node):
         self.declare_parameter("num_history_steps", 16)
 
         self._frame_id = self.get_parameter("frame_id").value
-        self._num_frames = self.get_parameter("num_frames").as_int()
-        self._num_history_steps = self.get_parameter("num_history_steps").as_int()
+        self._num_frames = self.get_parameter("num_frames").value
+        self._num_history_steps = self.get_parameter("num_history_steps").value
 
         KINEMATIC_STATE_HZ = 50.0
         ALPAMAYO_INPUT_HZ = 1.0
@@ -153,7 +153,7 @@ class AlpamayoTrtNode(Node):
             self.get_logger().info(f"TRT Expert loaded: {expert_onnx}")
 
         # Diffusion steps
-        num_steps = self.get_parameter("num_diffusion_steps").as_int()
+        num_steps = self.get_parameter("num_diffusion_steps").value
         self._model.diffusion.num_inference_steps = num_steps
 
         self._processor = helper.get_processor(self._model.tokenizer)
@@ -162,7 +162,7 @@ class AlpamayoTrtNode(Node):
         torch.cuda.manual_seed_all(0)
 
         # ── Timer ──
-        period = self.get_parameter("inference_period_sec").as_double()
+        period = self.get_parameter("inference_period_sec").value
         self._timer = self.create_timer(period, self._timer_callback)
         self.get_logger().info(
             f"Alpamayo TRT node ready ({num_steps}-step diffusion, period={period}s)"
@@ -268,8 +268,8 @@ class AlpamayoTrtNode(Node):
         model_inputs = helper.to_device(model_inputs, device=self._device)
 
         use_greedy = self.get_parameter("use_greedy_decode").value
-        top_p = 1.0 if use_greedy else self.get_parameter("top_p").as_double()
-        temperature = 1.0 if use_greedy else self.get_parameter("temperature").as_double()
+        top_p = 1.0 if use_greedy else self.get_parameter("top_p").value
+        temperature = 1.0 if use_greedy else self.get_parameter("temperature").value
 
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=self._dtype):
             pred_xyz, pred_rot, extra = self._model.sample_trajectories_from_data_with_vlm_rollout(
