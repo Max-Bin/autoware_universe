@@ -5,11 +5,14 @@
   <arg name="multimodal_engine_dir" default=""/>
   <arg name="expert_engine_path" default=""/>
 
+  <arg name="use_sim_time" default="false" description="Use simulation time for rosbag replay"/>
+
   <arg name="input/odometry" default="/localization/kinematic_state"/>
   <arg name="output/trajectory" default="/alpamayo/predicted_trajectory"/>
   <arg name="output/cot" default="/alpamayo/reasoning"/>
 
   <node pkg="autoware_tensorrt_alpamayo" exec="tensorrt_alpamayo_node" name="tensorrt_alpamayo_node" output="screen">
+    <param name="use_sim_time" value="$(var use_sim_time)"/>
     <param from="$(var tensorrt_alpamayo_param_path)"/>
     <param name="vlm_engine_dir" value="$(var vlm_engine_dir)"/>
     <param name="multimodal_engine_dir" value="$(var multimodal_engine_dir)"/>
