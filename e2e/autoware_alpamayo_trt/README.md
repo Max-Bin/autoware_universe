@@ -134,3 +134,10 @@ ros2 launch autoware_alpamayo_trt alpamayo_trt.launch.xml
 | `~/output/trajectory`         | `autoware_planning_msgs/Trajectory` | 64-waypoint planned trajectory     |
 | `~/output/cot`                | `std_msgs/String`                   | Chain-of-thought driving reasoning |
 | `~/output/trajectory_markers` | `visualization_msgs/MarkerArray`    | RViz visualization                 |
+
+---
+
+## References
+
+- [Alpamayo](https://github.com/NVlabs/alpamayo) — NVIDIA's vision-language-action model for autonomous driving (model weights, training, evaluation)
+- [alpamayo-autoware](https://github.com/autowarefoundation/alpamayo-autoware) — Reference ROS 2 Python node and Autoware integration by Autoware Foundation
