@@ -16,24 +16,28 @@ This node is designed for real-vehicle deployment within the [Autoware](https://
 
 Benchmarked on **NVIDIA RTX PRO 6000 Blackwell** (96 GB GDDR7, SM120) with 4 cameras × 4 temporal frames = 16 images at 1080×1920 resolution.
 
-| Configuration                                   | End-to-End Latency | FPS     | Trajectory Quality |
-| ----------------------------------------------- | ------------------ | ------- | ------------------ |
-| Baseline (native expert, sampling, 10-step)     | 775 ms             | 1.3     | Best accuracy      |
-| + TRT Expert (sampling, 10-step)                | 769 ms             | 1.3     | Near-identical     |
-| **+ TRT Expert + greedy + 5-step (Speed Mode)** | **663 ms**         | **1.5** | Δ2.6 m vs baseline |
+| Configuration                                            | End-to-End Latency | FPS     | Trajectory        |
+| -------------------------------------------------------- | ------------------ | ------- | ----------------- |
+| Baseline (CPU preproc, native expert, sampling, 10-step) | 1031 ms            | 1.0     | Reference         |
+| + TRT Expert                                             | 913 ms             | 1.1     | ~3% deviation     |
+| + GPU preprocessing                                      | 770 ms             | 1.3     | ~3% deviation     |
+| + Greedy decode                                          | 709 ms             | 1.4     | ~5% deviation     |
+| **Speed Mode (all optimizations)**                       | **656 ms**         | **1.5** | **~5% deviation** |
 
-> **End-to-end latency** includes JPEG decode, image preprocessing, tokenization, VLM generation, expert diffusion, and trajectory decoding. No steps are excluded.
+> **End-to-end latency** is measured from raw JPEG bytes to trajectory output. All stages included: JPEG decode, image resize, tokenization, VLM generation, expert diffusion, and trajectory decoding. No steps are excluded.
+
+**Speed Mode achieves 36% latency reduction** (1031 → 656 ms) with ~5% trajectory deviation from baseline.
 
 ### Enabling Speed Mode (~1.5 FPS)
 
 Set the following parameters in `alpamayo_trt.param.yaml`:
 
 ```yaml
-num_diffusion_steps: 5 # 5 instead of 10 (~40 ms faster)
-use_greedy_decode: true # Deterministic decode (~60 ms faster)
+num_diffusion_steps: 5 # 5 instead of 10
+use_greedy_decode: true # Deterministic decode
 ```
 
-Speed Mode uses greedy decoding (deterministic) and 5-step diffusion. The trajectory differs by ~2.6 m compared to the default 10-step sampling configuration. For safety-critical applications, use the default settings.
+Speed Mode combines GPU-accelerated preprocessing, TRT FP16 expert engine, greedy decoding, and 5-step diffusion. The trajectory deviates by approximately 5% compared to the default configuration. For safety-critical applications, use the default settings.
 
 ---
 

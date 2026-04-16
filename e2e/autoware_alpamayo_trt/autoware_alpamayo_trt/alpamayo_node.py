@@ -28,7 +28,6 @@ from typing import Optional
 from autoware_planning_msgs.msg import Trajectory
 from autoware_planning_msgs.msg import TrajectoryPoint
 from builtin_interfaces.msg import Duration
-import cv2
 from geometry_msgs.msg import Point
 from nav_msgs.msg import Odometry
 import numpy as np
@@ -42,6 +41,7 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import ColorRGBA
 from std_msgs.msg import String
 import torch
+import torchvision
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
 
@@ -175,13 +175,9 @@ class AlpamayoTrtNode(Node):
     # ── Callbacks (identical to alpamayo_ros) ──
 
     def _image_callback(self, topic: str, msg: CompressedImage) -> None:
-        np_arr = np.frombuffer(msg.data, np.uint8)
-        image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-        if image is None:
-            return
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        tensor = torch.from_numpy(image).permute(2, 0, 1).contiguous()
-        self._camera_buffers[topic].append((msg.header.stamp, tensor))
+        # Store raw JPEG bytes for GPU decode in inference thread
+        jpeg_bytes = torch.frombuffer(bytearray(msg.data), dtype=torch.uint8)
+        self._camera_buffers[topic].append((msg.header.stamp, jpeg_bytes))
 
     def _odometry_callback(self, msg: Odometry) -> None:
         self._odometry_buffer.append(msg)
@@ -201,11 +197,11 @@ class AlpamayoTrtNode(Node):
         if not all(len(buf) >= self._num_frames for buf in self._camera_buffers.values()):
             return None
 
-        camera_tensors = []
+        # Collect raw JPEG bytes per camera
+        jpeg_buffers = []
         for topic in self._camera_topics:
             frames = list(self._camera_buffers[topic])[-self._num_frames :]
-            camera_tensors.append(torch.stack([f for _, f in frames], dim=0))
-        image_frames = torch.stack(camera_tensors, dim=0)
+            jpeg_buffers.extend([f for _, f in frames])
 
         if len(self._odometry_buffer) < self._num_history_steps * self._skip_num:
             return None
@@ -228,7 +224,7 @@ class AlpamayoTrtNode(Node):
         history_rot = np.einsum("ij,njk->nik", t0_rot_inv, rotations_np)
 
         return {
-            "image_frames": image_frames,
+            "jpeg_buffers": jpeg_buffers,
             "ego_history_xyz": torch.from_numpy(history_xyz).unsqueeze(0).unsqueeze(0),
             "ego_history_rot": torch.from_numpy(history_rot).unsqueeze(0).unsqueeze(0),
         }
@@ -237,8 +233,25 @@ class AlpamayoTrtNode(Node):
 
     def _run_inference(self, payload: dict) -> dict:
         start = time.time()
-        frames = payload["image_frames"]
-        messages = helper.create_message(frames.flatten(0, 1))
+
+        # GPU JPEG decode + GPU batch resize (saves ~150ms vs CPU path)
+        decoded = []
+        for jpeg_buf in payload["jpeg_buffers"]:
+            decoded.append(torchvision.io.decode_jpeg(jpeg_buf, device="cuda"))
+        stacked = torch.stack(decoded)  # [16, 3, H, W] on GPU
+        resized = torch.nn.functional.interpolate(
+            stacked.float(), size=(560, 1008), mode="bicubic", align_corners=False
+        )
+        resized_cpu = resized.clamp(0, 255).to(torch.uint8).cpu()
+
+        # Group into cameras
+        n_cams = len(self._camera_topics)
+        camera_tensors = [
+            resized_cpu[i * self._num_frames : (i + 1) * self._num_frames] for i in range(n_cams)
+        ]
+        image_frames = torch.stack(camera_tensors)  # [n_cams, n_frames, 3, H, W]
+
+        messages = helper.create_message(image_frames.flatten(0, 1))
         processor_inputs = self._processor.apply_chat_template(
             messages,
             tokenize=True,
