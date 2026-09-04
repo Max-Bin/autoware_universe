@@ -16,10 +16,6 @@
   <arg name="build_only" default="false" description="shutdown node after the TensorRT engine files are built"/>
   <arg name="use_sim_time" default="false" description="use /clock (rosbag replay); the input staleness checks need it"/>
   <arg name="launch_prefix" default="" description="wrap the node process (e.g. compute-sanitizer, gdb -ex run --args)"/>
-  <arg name="rviz" default="false" description="open RViz (the standard Autoware layout)"/>
-  <!-- The standard layout draws /planning/trajectory; pass
-       output_trajectory:=/planning/trajectory to see this node's output in it. -->
-  <arg name="rviz_config" default="$(find-pkg-share autoware_launch)/rviz/autoware.rviz"/>
   <!-- A full Autoware stack already publishes /robot_description from its vehicle
        launch, so this is off by default. Enable it for a standalone replay, where
        nothing else draws the ego: vehicle_model_publisher:=true vehicle_model:=NAME
@@ -79,8 +75,4 @@
     <param name="use_sim_time" value="$(var use_sim_time)"/>
   </node>
 
-  <node pkg="rviz2" exec="rviz2" name="rviz2" output="screen" args="-d $(var rviz_config)"
-        if="$(var rviz)">
-    <param name="use_sim_time" value="$(var use_sim_time)"/>
-  </node>
 </launch>
