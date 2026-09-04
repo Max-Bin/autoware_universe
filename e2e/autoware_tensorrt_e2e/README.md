@@ -179,12 +179,15 @@ Every parameter is described in `schema/tensorrt_e2e.schema.json`.
 
 ## Visualization
 
-Every launch file takes `rviz:=true`, which opens the standard Autoware layout
-(`autoware_launch/rviz/autoware.rviz`). That layout draws `/planning/trajectory`, so remap
-the output there to see it:
+This package starts no RViz and ships no layout, the way `autoware_diffusion_planner`
+does not: what a window should show belongs to the stack that assembles the run, not to
+one node inside it.
+
+Autoware's standard layout draws `/planning/trajectory`, so a run that wants to see this
+node's output there remaps it:
 
 ```bash
-ros2 launch autoware_tensorrt_e2e <launch file> rviz:=true use_sim_time:=true \
+ros2 launch autoware_tensorrt_e2e <launch file> use_sim_time:=true \
   output_trajectory:=/planning/trajectory
 ```
 
