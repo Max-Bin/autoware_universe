@@ -143,6 +143,8 @@ public:
 private:
   void init_engine(const Config & config);
   void init_detection(const Config & config);
+  /// Give every engine output an address, including ones this node never reads.
+  void bind_unread_outputs();
   bool validate_cloud_layout(
     const sensor_msgs::msg::PointCloud2 & cloud, std::string & error) const;
 
@@ -164,6 +166,9 @@ private:
   autoware::cuda_utils::CudaUniquePtr<float[]> bbox_pred_d_;
   autoware::cuda_utils::CudaUniquePtr<float[]> score_d_;
   autoware::cuda_utils::CudaUniquePtr<int64_t[]> label_pred_d_;
+  /// Outputs bound above, by engine tensor name; the rest get scratch buffers.
+  std::vector<std::string> bound_outputs_;
+  std::vector<autoware::cuda_utils::CudaUniquePtr<uint8_t[]>> unread_output_scratch_;
 
   int64_t channels_{0};
   int64_t height_{0};

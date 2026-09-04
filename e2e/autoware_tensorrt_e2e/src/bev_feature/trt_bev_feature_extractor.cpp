@@ -162,8 +162,80 @@ void TrtBevFeatureExtractor::init_engine(const Config & config)
   trt_common_->setTensorAddress("num_points_per_voxel", num_points_per_voxel_d_.get());
   trt_common_->setTensorAddress("coors", voxel_coords_d_.get());
   trt_common_->setTensorAddress(feature_tensor_.c_str(), feature_d_.get());
+  bound_outputs_.push_back(feature_tensor_);
 
   init_detection(config);
+  bind_unread_outputs();
+}
+
+namespace
+{
+size_t element_size(const nvinfer1::DataType dtype)
+{
+  switch (dtype) {
+    case nvinfer1::DataType::kFLOAT:
+    case nvinfer1::DataType::kINT32:
+      return 4;
+    case nvinfer1::DataType::kHALF:
+    case nvinfer1::DataType::kBF16:
+      return 2;
+    case nvinfer1::DataType::kINT64:
+      return 8;
+    case nvinfer1::DataType::kINT8:
+    case nvinfer1::DataType::kUINT8:
+    case nvinfer1::DataType::kBOOL:
+    case nvinfer1::DataType::kFP8:
+      return 1;
+    default:
+      return 0;
+  }
+}
+}  // namespace
+
+void TrtBevFeatureExtractor::bind_unread_outputs()
+{
+  // enqueueV3 requires an address for EVERY output the engine declares, not just the
+  // ones this node reads. The extractor graph carries a detection head whether or not
+  // the deployment asked for boxes, so with the head switched off its three outputs
+  // were left unbound and every inference failed with "Neither address or allocator is
+  // set for output tensor bbox_pred" -- no BEV feature, no trajectory, and nothing in
+  // the node's own logs to say why. Give the leftovers scratch buffers and ignore them.
+  const int32_t num_io = trt_common_->getNbIOTensors();
+  for (int32_t i = 0; i < num_io; ++i) {
+    const char * name = trt_common_->getIOTensorName(i);
+    if (trt_common_->getTensorIOMode(name) != nvinfer1::TensorIOMode::kOUTPUT) {
+      continue;
+    }
+    if (
+      std::find(bound_outputs_.begin(), bound_outputs_.end(), std::string(name)) !=
+      bound_outputs_.end()) {
+      continue;
+    }
+
+    const nvinfer1::Dims dims = trt_common_->getTensorShape(name);
+    size_t count = 1;
+    for (int32_t d = 0; d < dims.nbDims; ++d) {
+      // A dynamic extent would make the size unknowable here; the extractor's profile
+      // is static, so treat one as a graph this node cannot safely run.
+      if (dims.d[d] < 0) {
+        throw std::runtime_error(
+          "The BEV feature extractor's output '" + std::string(name) +
+          "' has a dynamic extent; its size cannot be bound ahead of inference");
+      }
+      count *= static_cast<size_t>(dims.d[d]);
+    }
+    const auto dtype = trt_common_->getTensorDataType(name);
+    const size_t bytes = count * (dtype ? element_size(*dtype) : 0);
+    if (bytes == 0) {
+      throw std::runtime_error(
+        "The BEV feature extractor's output '" + std::string(name) +
+        "' has an unsupported data type; it cannot be given a buffer");
+    }
+
+    unread_output_scratch_.push_back(autoware::cuda_utils::make_unique<uint8_t[]>(bytes));
+    trt_common_->setTensorAddress(name, unread_output_scratch_.back().get());
+    bound_outputs_.emplace_back(name);
+  }
 }
 
 void TrtBevFeatureExtractor::init_detection(const Config & config)
@@ -233,6 +305,9 @@ void TrtBevFeatureExtractor::init_detection(const Config & config)
   trt_common_->setTensorAddress(detection.bbox_tensor.c_str(), bbox_pred_d_.get());
   trt_common_->setTensorAddress(detection.score_tensor.c_str(), score_d_.get());
   trt_common_->setTensorAddress(detection.label_tensor.c_str(), label_pred_d_.get());
+  bound_outputs_.push_back(detection.bbox_tensor);
+  bound_outputs_.push_back(detection.score_tensor);
+  bound_outputs_.push_back(detection.label_tensor);
 
   postprocess_ =
     std::make_unique<autoware::bevfusion::PostprocessCuda>(bevfusion_config_, stream_);
