@@ -16,7 +16,9 @@
 #define AUTOWARE__TENSORRT_E2E__BEV_FEATURE__TRT_BEV_FEATURE_EXTRACTOR_HPP_
 
 #include <autoware/bevfusion/bevfusion_config.hpp>
+#include <autoware/bevfusion/postprocess/postprocess_kernel.hpp>
 #include <autoware/bevfusion/preprocess/preprocess_kernel.hpp>
+#include <autoware/bevfusion/utils.hpp>
 #include <autoware/cuda_utils/cuda_unique_ptr.hpp>
 #include <autoware/tensorrt_common/tensorrt_common.hpp>
 
@@ -68,6 +70,37 @@ public:
     std::vector<float> point_cloud_range;  //!< [x/y/z min, x/y/z max]
     std::vector<float> voxel_size;         //!< [x, y, z]
     bool use_intensity{false};
+
+    /**
+     * @brief The BEVFusion detection head that the extractor graph now carries.
+     *
+     * The exported graph emits `bbox_pred [10, P]`, `score [P]` and `label_pred [P]`
+     * next to the feature map -- undecoded proposals, exactly as AWML's released
+     * `bevfusion_lidar.onnx` stops at them, because `autoware_tensorrt_bevfusion`
+     * decodes and suppresses on the C++ side. Decoding here reuses that node's own
+     * `PostprocessCuda`, so the boxes are the ones BEVFusion would have published.
+     */
+    struct Detection
+    {
+      //! Off by default: a graph without the head is still a valid extractor.
+      bool enabled{false};
+      std::string bbox_tensor{"bbox_pred"};
+      std::string score_tensor{"score"};
+      std::string label_tensor{"label_pred"};
+      //! Proposal count the head emits; validated against the engine's own shapes.
+      int64_t num_proposals{0};
+      //! BEV stride the TransFusion coder decodes centres with.
+      int64_t out_size_factor{8};
+      //! Pre-filter applied on the device. The head's thresholds are per class, which
+      //! `PostprocessCuda` cannot express, so the lowest of them is used here and the
+      //! per-class cut is applied on the host (see DetectionPostprocessor).
+      float score_threshold{0.0f};
+      float circle_nms_dist_threshold{0.0f};
+      //! One entry per class; a proposal whose (sin, cos) norm falls below its class's
+      //! threshold is scored zero, as in autoware_bevfusion.
+      std::vector<double> yaw_norm_thresholds;
+    };
+    Detection detection;
   };
 
   /**
@@ -89,6 +122,19 @@ public:
    */
   const float * extract(const cuda_blackboard::CudaPointCloud2 & cloud, std::string & error);
 
+  /// True when the engine carries the detection head and it was configured on.
+  bool detection_enabled() const { return detection_enabled_; }
+  /**
+   * @brief Decoded, circle-NMS'd proposals of the last extract().
+   *
+   * Empty when detection is disabled. Boxes are in the frame of the cloud that
+   * produced them, in metres, still carrying every class the head knows.
+   */
+  const std::vector<autoware::bevfusion::Box3D> & last_detections() const
+  {
+    return last_detections_;
+  }
+
   /// Voxel count of the last extract(), before clamping to the profile maximum.
   int64_t last_num_voxels() const { return last_num_voxels_; }
   /// False when the last cloud produced more voxels than the profile maximum and was clipped.
@@ -96,6 +142,7 @@ public:
 
 private:
   void init_engine(const Config & config);
+  void init_detection(const Config & config);
   bool validate_cloud_layout(
     const sensor_msgs::msg::PointCloud2 & cloud, std::string & error) const;
 
@@ -104,6 +151,7 @@ private:
   cudaStream_t stream_;
 
   std::unique_ptr<autoware::bevfusion::PreprocessCuda> preprocess_;
+  std::unique_ptr<autoware::bevfusion::PostprocessCuda> postprocess_;
   std::unique_ptr<autoware::tensorrt_common::TrtCommon> trt_common_;
 
   // Device buffers (allocated once at maximum size)
@@ -113,12 +161,17 @@ private:
   autoware::cuda_utils::CudaUniquePtr<int32_t[]> voxel_coords_d_;
   autoware::cuda_utils::CudaUniquePtr<int32_t[]> num_points_per_voxel_d_;
   autoware::cuda_utils::CudaUniquePtr<float[]> feature_d_;
+  autoware::cuda_utils::CudaUniquePtr<float[]> bbox_pred_d_;
+  autoware::cuda_utils::CudaUniquePtr<float[]> score_d_;
+  autoware::cuda_utils::CudaUniquePtr<int64_t[]> label_pred_d_;
 
   int64_t channels_{0};
   int64_t height_{0};
   int64_t width_{0};
   int64_t last_num_voxels_{0};
   bool last_voxels_within_range_{true};
+  bool detection_enabled_{false};
+  std::vector<autoware::bevfusion::Box3D> last_detections_;
 };
 
 }  // namespace autoware::tensorrt_e2e

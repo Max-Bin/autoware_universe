@@ -18,10 +18,13 @@
 #include "autoware/tensorrt_e2e/bev_feature/temporal_bev_cache.hpp"
 #include "autoware/tensorrt_e2e/bev_feature/trt_bev_feature_extractor.hpp"
 #include "autoware/tensorrt_e2e/input_provider.hpp"
+#include "autoware/tensorrt_e2e/postprocess/detection_postprocessor.hpp"
 
 #include <cuda_blackboard/cuda_blackboard_subscriber.hpp>
 #include <cuda_blackboard/cuda_pointcloud2.hpp>
 #include <rclcpp/rclcpp.hpp>
+
+#include <autoware_perception_msgs/msg/detected_objects.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -48,6 +51,11 @@ namespace autoware::tensorrt_e2e
  * names, voxelization -- comes from the model's ml_package file, the one configuration the
  * model directory ships.
  *
+ * The extractor graph also carries the frozen BEVFusion detection head, so the same
+ * engine pass that produces the feature map produces the boxes AWML's own BEVFusion
+ * export ships. They are decoded and published on `~/output/detected_objects` with
+ * `autoware_bevfusion`'s own postprocessing; nothing in the planner path reads them.
+ *
  * Claimable tensors:
  * - `bev_feature_history` (name configurable) `[1, K, C, H, W]`: device-resident.
  */
@@ -66,16 +74,23 @@ public:
     const EgoFrame & ego, const rclcpp::Time & now, TensorMap & inputs,
     std::string & error) override;
 
-  /// autoware_bevfusion's `is_num_voxels_within_range`.
+  /// autoware_bevfusion's `is_num_voxels_within_range`, plus the detection count.
   void add_diagnostics(autoware_utils_diagnostics::DiagnosticsInterface & diagnostics) override
   {
     diagnostics.add_key_value(
       "is_num_voxels_within_range", extractor_ ? extractor_->last_voxels_within_range() : true);
+    if (detection_postprocessor_) {
+      diagnostics.add_key_value("detected_object_count", last_detected_object_count_);
+    }
   }
   /// The cloud behind the current history.
   std::optional<rclcpp::Time> latest_input_stamp() const override { return last_extracted_stamp_; }
 
 private:
+  //! Declares the `bev_feature.detection.*` parameters; a no-op when the model is not
+  //! configured for the head.
+  void declare_detection_params();
+
   rclcpp::Node & node_;
 
   // Deployment parameters, from the package defaults and the model's ml_package file
@@ -90,6 +105,15 @@ private:
   // Pipeline
   std::unique_ptr<TrtBevFeatureExtractor> extractor_;
   std::unique_ptr<TemporalBevCache> cache_;
+
+  // The detection head riding along on the extractor graph. Null when the model does not
+  // enable it or the graph does not carry it.
+  DetectionPostprocessor::Config detection_config_;
+  bool detection_requested_{false};
+  std::unique_ptr<DetectionPostprocessor> detection_postprocessor_;
+  rclcpp::Publisher<autoware_perception_msgs::msg::DetectedObjects>::SharedPtr
+    detected_objects_pub_;
+  size_t last_detected_object_count_{0};
   cudaStream_t stream_{nullptr};
   std::optional<rclcpp::Time> last_extracted_stamp_;
   const float * history_ptr_{nullptr};

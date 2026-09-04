@@ -86,6 +86,7 @@ if(TRT_AVAIL AND CUDA_AVAIL)
     src/providers/lidar_input_provider.cpp
     src/providers/context_input_provider.cpp
     src/providers/bev_feature_input_provider.cpp
+    src/postprocess/detection_postprocessor.cpp
     src/postprocess/trajectory_postprocessor.cpp
     src/tensorrt_e2e_node.cpp
   )

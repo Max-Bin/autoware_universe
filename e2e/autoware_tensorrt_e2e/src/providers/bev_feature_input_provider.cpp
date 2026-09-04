@@ -20,9 +20,12 @@
 
 #include <rcl_interfaces/msg/parameter_descriptor.hpp>
 
+#include <algorithm>
 #include <array>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace autoware::tensorrt_e2e
@@ -109,6 +112,70 @@ BevFeatureInputProvider::BevFeatureInputProvider(rclcpp::Node & node) : node_(no
   extractor_config_.voxel_size.assign(voxel_size.begin(), voxel_size.end());
   extractor_config_.use_intensity =
     node_.declare_parameter<bool>("bev_feature.extractor.use_intensity", network_field());
+
+  declare_detection_params();
+}
+
+void BevFeatureInputProvider::declare_detection_params()
+{
+  // The detection head is optional: a model whose extractor graph predates it simply
+  // leaves this off, and the provider behaves exactly as before.
+  detection_requested_ = node_.declare_parameter<bool>("bev_feature.detection.enabled", false);
+  if (!detection_requested_) {
+    return;
+  }
+
+  // Network description -- the head's own, written into the ml_package file by the
+  // exporter, so no defaults here.
+  detection_config_.class_names = node_.declare_parameter<std::vector<std::string>>(
+    "bev_feature.detection.class_names", network_field());
+  detection_config_.score_thresholds = node_.declare_parameter<std::vector<double>>(
+    "bev_feature.detection.score_thresholds", network_field());
+  extractor_config_.detection.num_proposals =
+    node_.declare_parameter<int64_t>("bev_feature.detection.num_proposals", network_field());
+  extractor_config_.detection.out_size_factor =
+    node_.declare_parameter<int64_t>("bev_feature.detection.out_size_factor", network_field());
+
+  // Host behaviour -- the same knobs, with the same names and defaults, that
+  // autoware_bevfusion keeps in its deployment file rather than its ml_package.
+  extractor_config_.detection.circle_nms_dist_threshold = static_cast<float>(
+    node_.declare_parameter<double>("bev_feature.detection.circle_nms_dist_threshold", 0.5));
+  detection_config_.iou_nms_search_distance_2d =
+    node_.declare_parameter<double>("bev_feature.detection.iou_nms_search_distance_2d", 10.0);
+  detection_config_.iou_nms_threshold =
+    node_.declare_parameter<double>("bev_feature.detection.iou_nms_threshold", 0.1);
+  extractor_config_.detection.yaw_norm_thresholds =
+    node_.declare_parameter<std::vector<double>>(
+      "bev_feature.detection.yaw_norm_thresholds", std::vector<double>{});
+  detection_config_.allow_remapping_by_area_matrix =
+    node_.declare_parameter<std::vector<int64_t>>(
+      "bev_feature.detection.allow_remapping_by_area_matrix", std::vector<int64_t>{});
+  detection_config_.min_area_matrix = node_.declare_parameter<std::vector<double>>(
+    "bev_feature.detection.min_area_matrix", std::vector<double>{});
+  detection_config_.max_area_matrix = node_.declare_parameter<std::vector<double>>(
+    "bev_feature.detection.max_area_matrix", std::vector<double>{});
+
+  const size_t num_classes = detection_config_.class_names.size();
+  if (extractor_config_.detection.yaw_norm_thresholds.empty()) {
+    // The decode kernel indexes this by class; a zero floor keeps every box, which is
+    // what autoware_bevfusion configures for the classes it does not gate.
+    extractor_config_.detection.yaw_norm_thresholds.assign(num_classes, 0.0);
+  } else if (extractor_config_.detection.yaw_norm_thresholds.size() != num_classes) {
+    throw std::runtime_error(
+      "bev_feature.detection.yaw_norm_thresholds has " +
+      std::to_string(extractor_config_.detection.yaw_norm_thresholds.size()) +
+      " entries but the head has " + std::to_string(num_classes) + " classes");
+  }
+
+  // PostprocessCuda holds ONE score threshold, the head states one per class: the device
+  // filter runs at the lowest and DetectionPostprocessor applies the per-class cut, so
+  // the two together are the head's own thresholds and nothing is dropped early.
+  extractor_config_.detection.score_threshold =
+    detection_config_.score_thresholds.empty()
+      ? 0.0f
+      : static_cast<float>(*std::min_element(
+          detection_config_.score_thresholds.begin(), detection_config_.score_thresholds.end()));
+  extractor_config_.detection.enabled = true;
 }
 
 BevFeatureInputProvider::~BevFeatureInputProvider()
@@ -164,6 +231,29 @@ std::vector<std::string> BevFeatureInputProvider::claim_inputs(
   cache_ = std::make_unique<TemporalBevCache>(
     cache_config_, extractor_->channels(), extractor_->height(), extractor_->width());
 
+  if (detection_requested_) {
+    if (extractor_->detection_enabled()) {
+      detection_postprocessor_ = std::make_unique<DetectionPostprocessor>(detection_config_);
+      detected_objects_pub_ =
+        node_.create_publisher<autoware_perception_msgs::msg::DetectedObjects>(
+          "~/output/detected_objects", rclcpp::QoS(1));
+      RCLCPP_INFO_STREAM(
+        node_.get_logger(), "BEV feature extractor detection head enabled: "
+                              << detection_config_.class_names.size() << " classes, "
+                              << extractor_config_.detection.num_proposals << " proposals");
+    } else {
+      // Configured on, but this graph has no head. That is a stale artifact next to a
+      // current config, and silently publishing nothing would look like a dead detector.
+      RCLCPP_WARN(
+        node_.get_logger(),
+        "bev_feature.detection is enabled but the extractor graph (%s) has no '%s'/'%s'/'%s' "
+        "outputs; no objects will be published",
+        extractor_config_.onnx_path.c_str(), extractor_config_.detection.bbox_tensor.c_str(),
+        extractor_config_.detection.score_tensor.c_str(),
+        extractor_config_.detection.label_tensor.c_str());
+    }
+  }
+
   pointcloud_sub_ = std::make_unique<
     cuda_blackboard::CudaBlackboardSubscriber<cuda_blackboard::CudaPointCloud2>>(
     node_, "~/input/pointcloud",
@@ -211,6 +301,15 @@ bool BevFeatureInputProvider::collect(
       RCLCPP_WARN_THROTTLE(
         node_.get_logger(), *node_.get_clock(), LOG_THROTTLE_INTERVAL_MS,
         "LiDAR timestamps went backwards (time jump or bag loop); BEV feature cache reset");
+    }
+    // The boxes belong to this cloud, so they are published once per LiDAR frame rather
+    // than once per planning tick -- republishing the same detection at 10 Hz would give
+    // a consumer a false sense of a fresh measurement.
+    if (detection_postprocessor_) {
+      const auto objects = detection_postprocessor_->build(
+        extractor_->last_detections(), cloud->header);
+      last_detected_object_count_ = objects.objects.size();
+      detected_objects_pub_->publish(objects);
     }
     last_extracted_stamp_ = cloud_stamp;
     history_ptr_ = nullptr;

@@ -56,17 +56,20 @@ BEVFusionConfig make_lidar_only_config(const TrtBevFeatureExtractor::Config & co
   if (config.voxel_size.size() != 3) {
     throw std::runtime_error("bev_feature.extractor.voxel_size must have 3 elements");
   }
-  // Empty image-backbone paths select the lidar-only mode; camera and postprocess parameters
-  // are unused on this path and passed as neutral values.
+  // Empty image-backbone paths select the lidar-only mode; the camera parameters are
+  // unused on this path and passed as neutral values. The postprocess parameters are
+  // real whenever the graph carries the detection head -- `PostprocessCuda` decodes
+  // proposals out of exactly this config.
+  const auto & detection = config.detection;
   return BEVFusionConfig(
-    config.plugins_path, "", "", "",
-    /*out_size_factor=*/8, config.cloud_capacity, config.max_points_per_voxel, config.voxels_num,
-    config.point_cloud_range, config.voxel_size, /*d_bound=*/{}, /*x_bound=*/{}, /*y_bound=*/{},
+    config.plugins_path, "", "", "", detection.out_size_factor, config.cloud_capacity,
+    config.max_points_per_voxel, config.voxels_num, config.point_cloud_range, config.voxel_size,
+    /*d_bound=*/{}, /*x_bound=*/{}, /*y_bound=*/{},
     /*z_bound=*/{}, /*num_cameras=*/0, /*raw_image_height=*/0, /*raw_image_width=*/0,
     /*img_aug_scale_x=*/0.0f, /*img_aug_scale_y=*/0.0f, /*roi_height=*/0, /*roi_width=*/0,
     /*features_height=*/0, /*features_width=*/0, /*num_depth_features=*/0,
-    /*image_feature_channel=*/0, /*num_proposals=*/0, /*circle_nms_dist_threshold=*/0.0f,
-    /*yaw_norm_thresholds=*/{}, /*score_threshold=*/0.0f, config.use_intensity);
+    /*image_feature_channel=*/0, detection.num_proposals, detection.circle_nms_dist_threshold,
+    detection.yaw_norm_thresholds, detection.score_threshold, config.use_intensity);
 }
 
 }  // namespace
@@ -159,6 +162,82 @@ void TrtBevFeatureExtractor::init_engine(const Config & config)
   trt_common_->setTensorAddress("num_points_per_voxel", num_points_per_voxel_d_.get());
   trt_common_->setTensorAddress("coors", voxel_coords_d_.get());
   trt_common_->setTensorAddress(feature_tensor_.c_str(), feature_d_.get());
+
+  init_detection(config);
+}
+
+void TrtBevFeatureExtractor::init_detection(const Config & config)
+{
+  const auto & detection = config.detection;
+  if (!detection.enabled) {
+    return;
+  }
+
+  // A graph exported before the head was added is still a valid extractor: say the head
+  // is absent and run without it, rather than failing a deployment that never asked for
+  // boxes. A graph that HAS the tensors but disagrees on their shape is a real mismatch.
+  std::vector<std::string> engine_tensors;
+  const int32_t num_io = trt_common_->getNbIOTensors();
+  engine_tensors.reserve(static_cast<size_t>(num_io));
+  for (int32_t i = 0; i < num_io; ++i) {
+    engine_tensors.emplace_back(trt_common_->getIOTensorName(i));
+  }
+  const auto has_tensor = [&engine_tensors](const std::string & name) {
+    return std::find(engine_tensors.begin(), engine_tensors.end(), name) != engine_tensors.end();
+  };
+  const bool complete = has_tensor(detection.bbox_tensor) && has_tensor(detection.score_tensor) &&
+                        has_tensor(detection.label_tensor);
+  if (!complete) {
+    return;
+  }
+
+  if (detection.num_proposals <= 0) {
+    throw std::runtime_error(
+      "bev_feature.detection is enabled but num_proposals is " +
+      std::to_string(detection.num_proposals));
+  }
+  const auto class_count = static_cast<int64_t>(detection.yaw_norm_thresholds.size());
+  if (class_count <= 0) {
+    throw std::runtime_error(
+      "bev_feature.detection.yaw_norm_thresholds is empty; the decode kernel indexes it by "
+      "class and would read out of bounds");
+  }
+
+  // The decode kernel reads bbox_pred as [num_box_values, num_proposals] and the other two
+  // as [num_proposals]; a graph whose head was exported with a different proposal count
+  // would be read at the wrong stride.
+  const auto expect = [this](const std::string & name, const std::vector<int64_t> & want) {
+    const nvinfer1::Dims dims = trt_common_->getTensorShape(name.c_str());
+    std::vector<int64_t> got;
+    for (int32_t i = 0; i < dims.nbDims; ++i) {
+      got.push_back(dims.d[i]);
+    }
+    if (got != want) {
+      throw std::runtime_error(
+        "The BEV feature extractor's detection output '" + name + "' has shape " +
+        shape_to_string(got) + ", expected " + shape_to_string(want) +
+        " (bev_feature.detection.num_proposals disagrees with the graph)");
+    }
+  };
+  const int64_t proposals = detection.num_proposals;
+  const int64_t box_values = bevfusion_config_.num_box_values_;
+  expect(detection.bbox_tensor, {box_values, proposals});
+  expect(detection.score_tensor, {proposals});
+  expect(detection.label_tensor, {proposals});
+
+  bbox_pred_d_ =
+    autoware::cuda_utils::make_unique<float[]>(static_cast<size_t>(box_values) * proposals);
+  score_d_ = autoware::cuda_utils::make_unique<float[]>(static_cast<size_t>(proposals));
+  label_pred_d_ = autoware::cuda_utils::make_unique<int64_t[]>(static_cast<size_t>(proposals));
+
+  trt_common_->setTensorAddress(detection.bbox_tensor.c_str(), bbox_pred_d_.get());
+  trt_common_->setTensorAddress(detection.score_tensor.c_str(), score_d_.get());
+  trt_common_->setTensorAddress(detection.label_tensor.c_str(), label_pred_d_.get());
+
+  postprocess_ =
+    std::make_unique<autoware::bevfusion::PostprocessCuda>(bevfusion_config_, stream_);
+  last_detections_.reserve(static_cast<size_t>(proposals));
+  detection_enabled_ = true;
 }
 
 bool TrtBevFeatureExtractor::validate_cloud_layout(
@@ -235,6 +314,15 @@ const float * TrtBevFeatureExtractor::extract(
     return nullptr;
   }
   CHECK_CUDA_ERROR(cudaStreamSynchronize(stream_));
+
+  if (detection_enabled_) {
+    // autoware_bevfusion's own decode: TransFusion coder, score cut, circle NMS. The
+    // boxes come back on the host, already sorted by score.
+    last_detections_.clear();
+    CHECK_CUDA_ERROR(postprocess_->generateDetectedBoxes3D_launch(
+      label_pred_d_.get(), bbox_pred_d_.get(), score_d_.get(), last_detections_, stream_));
+    CHECK_CUDA_ERROR(cudaStreamSynchronize(stream_));
+  }
   return feature_d_.get();
 }
 

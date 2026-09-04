@@ -36,6 +36,21 @@
         voxels_num: [1, 128000, 256000]  # [min, opt, max]
         point_cloud_range: [-122.4, -122.4, -3.0, 122.4, 122.4, 5.0]
         voxel_size: [0.17, 0.17, 0.2]
+      detection:
+        # The frozen BEVFusion detection head the extractor graph carries. It
+        # emits undecoded proposals, exactly as AWML's released
+        # bevfusion_lidar.onnx does; the node decodes and suppresses them with
+        # autoware_bevfusion's own postprocessing.
+        enabled: true
+        class_names: ["CAR", "TRUCK", "BUS", "BICYCLE", "PEDESTRIAN", "UNKNOWN", "UNKNOWN"]
+        # head classes: ["car", "truck", "bus", "bicycle", "pedestrian", "traffic_cone", "barrier"]
+        # no ObjectClassification label: traffic_cone->UNKNOWN, barrier->UNKNOWN
+        num_proposals: 500
+        out_size_factor: 8
+        # Per class, from the head's own bbox coder. The device pre-filter uses
+        # the lowest of them; the per-class cut is applied on the host.
+        score_thresholds: [0.015, 0.01, 0.01, 0.02, 0.03, 0.04, 0.02]
+
 
     postprocess:
       prediction_tensor: "trajectory"

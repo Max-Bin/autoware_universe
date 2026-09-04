@@ -45,6 +45,10 @@
   <arg name="output_trajectory" default="~/output/trajectory"/>
   <arg name="output_trajectories" default="~/output/trajectories"/>
   <arg name="output_predicted_objects" default="~/output/predicted_objects"/>
+  <!-- The frozen BEVFusion detection head riding along on the extractor graph. Published
+       once per LiDAR frame, in that cloud's frame, with autoware_bevfusion's own
+       postprocessing; nothing in the planner path reads it. -->
+  <arg name="output_detected_objects" default="~/output/detected_objects"/>
 
   <node pkg="autoware_tensorrt_e2e" exec="autoware_tensorrt_e2e_node" name="tensorrt_e2e" output="both" launch-prefix="$(var launch_prefix)">
     <param from="$(var model_param_path)" allow_substs="true"/>
@@ -64,6 +68,7 @@
     <remap from="~/output/trajectory" to="$(var output_trajectory)"/>
     <remap from="~/output/trajectories" to="$(var output_trajectories)"/>
     <remap from="~/output/predicted_objects" to="$(var output_predicted_objects)"/>
+    <remap from="~/output/detected_objects" to="$(var output_detected_objects)"/>
   </node>
 
   <node pkg="robot_state_publisher" exec="robot_state_publisher" name="robot_state_publisher"
