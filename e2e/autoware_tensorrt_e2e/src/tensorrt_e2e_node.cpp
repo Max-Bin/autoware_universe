@@ -280,7 +280,25 @@ void TensorrtE2eNode::create_providers()
 
 void TensorrtE2eNode::initialize_pipeline()
 {
-  diagnostics_->update_level_and_message(DiagnosticStatus::WARN, "Loading model");
+  // Providers first, engines second, so that every subscription exists from the node's
+  // first second -- before either engine is built, as the README says. Nothing in
+  // create_providers() needs an engine: the providers claim their tensors against the
+  // manifest below, once it exists. The order matters on a first launch, when TrtCommon
+  // builds instead of loads: the planner engine alone took 27 minutes on the vehicle
+  // (2026-09-14, the sensing stack sharing the GPU), and with the providers created after
+  // it the node spent those minutes with no subscription, no log line of its own and no
+  // diagnostic -- to `ros2 node info` and the container log, a node that had hung. With the
+  // subscriptions in place the wait is at least what it looks like, and the cached engines
+  // make every later launch load in seconds. (autoware_bevfusion subscribes after its build;
+  // its engine builds in a minute, and it has never had to wait 27.)
+  create_providers();
+
+  // Published once, here, and then nothing until the constructor returns: the 1 Hz
+  // report_status() timer does not run while the engines build. Say what the wait is.
+  diagnostics_->update_level_and_message(
+    DiagnosticStatus::WARN,
+    "Loading model " + params_.model_path +
+      " (a first launch builds the TensorRT engines: minutes to tens of minutes)");
   diagnostics_->publish(get_clock()->now());
 
   InferenceEngine::Config engine_config;
@@ -299,7 +317,6 @@ void TensorrtE2eNode::initialize_pipeline()
     RCLCPP_INFO_STREAM(get_logger(), "Engine inputs:" << manifest.str());
   }
 
-  create_providers();
   // One stream for the whole tick. A provider's GPU work, the network, and the output copy
   // are ordered on it, so nothing in the middle of a pass has to wait for the device: the
   // single host synchronization is the one that waits for the outputs.

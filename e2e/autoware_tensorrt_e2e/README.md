@@ -226,6 +226,34 @@ engines are built with the `trt_workspace_mib` workspace (default 4 GiB), an upp
 builder's scratch rather than an allocation; raise it only for a graph whose build reports
 insufficient workspace.
 
+### The first launch builds, and blocks
+
+A launch that finds no `.engine` beside an ONNX (or one older than it, or one another
+TensorRT version wrote) builds it, inside the node's constructor, exactly as
+`autoware_bevfusion` does. The difference is scale: bevfusion's engine builds in a minute;
+the ResWorld planner engine took **27 minutes** on the vehicle (RTX 4000 SFF Ada, TensorRT
+10.8, the sensing stack using the same GPU throughout), the extractor several more. For that
+whole time the component is loaded but not spinning -- `ros2 node info` lists its
+subscriptions (they are created before the build) but no callback runs, `inference_status`
+is not published, and the container log shows only TensorRT's "Please wait for a few
+minutes" every five seconds, under no node name. It is a wait, not a failure: the node logs
+`No cached TensorRT engine at ... building it` before it starts and `TensorRT engine ...
+built in N s` when it finishes, then comes up and plans. Every later launch deserializes the
+cached engines in seconds.
+
+Do not leave that build to the vehicle's start-up. After deploying a new ONNX -- and after a
+TensorRT or driver update, which invalidates every cached engine -- build the engines once,
+standalone, with the stack stopped so the builder has the GPU to itself:
+
+```bash
+ros2 launch autoware_tensorrt_e2e e2e_planner_<line>.launch.xml build_only:=true \
+  data_path:=<the model directory>
+```
+
+Copying an ONNX in place with `cp` (without `-p`) gives it a new mtime and makes its engine
+stale; the node removes and rebuilds it on the next launch. Copy with `cp -p` or `rsync -a`
+to keep a matching engine.
+
 ## Detection head
 
 The ResWorld extractor graph is the production BEVFusion-L lidar branch, and it is exported
